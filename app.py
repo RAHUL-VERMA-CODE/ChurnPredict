@@ -1,68 +1,104 @@
 import streamlit as st
-import numpy as np 
-import tensorflow as tf
-from sklearn.preprocessing import StandardScaler,LabelEncoder,OneHotEncoder
-import pandas as pd
-import pickle
+import requests
+import os
 
-from tensorflow import keras
+# your deployed fastapi backend (render). can be overridden with a secret/env var
+# if you ever move the backend somewhere else, just change this one line.
+try:
+    API_URL = st.secrets["API_URL"]
+except Exception:
+    API_URL = os.environ.get("API_URL", "https://churnpredict-1.onrender.com")
 
-model = keras.models.load_model('model.h5')
+st.set_page_config(page_title="Customer Churn Prediction", page_icon="📉", layout="centered")
 
-with open('Onehot_encoder_geo.pkl','rb') as file:
-    Onehot_encoder_geo=pickle.load(file)
+st.markdown("""
+<style>
+.big-title { font-size: 2rem; font-weight: 700; margin-bottom: 0; }
+.small-sub { color: gray; margin-top: 0; margin-bottom: 1.5rem; }
+.result-box {
+    padding: 1.2rem 1.5rem;
+    border-radius: 10px;
+    margin-top: 1rem;
+}
+.churn { background-color: #3a1a1a; border: 1px solid #ff4b4b; }
+.stay { background-color: #10321a; border: 1px solid #21c354; }
+</style>
+""", unsafe_allow_html=True)
 
-with open('label_encoder_gender.pkl','rb') as file:
-    label_encoder_gender=pickle.load(file) 
+st.markdown('<p class="big-title">📉 Customer Churn Prediction</p>', unsafe_allow_html=True)
+st.markdown('<p class="small-sub">Fill in the customer details and check if they are likely to churn.</p>', unsafe_allow_html=True)
 
-with open('scalar.pkl','rb') as file:
-    scaler=pickle.load(file)     
+# note: render free tier spins down when idle, first request can take 30-50s to wake up
+with st.sidebar:
+    st.subheader("API status")
+    if st.button("Check backend"):
+        try:
+            r = requests.get(f"{API_URL}/health", timeout=60)
+            if r.ok:
+                st.success("Backend is up")
+                st.json(r.json())
+            else:
+                st.warning(f"Backend returned {r.status_code}")
+        except requests.exceptions.RequestException as e:
+            st.error(f"Backend unreachable: {e}")
+    st.caption("First request after inactivity can be slow (Render free tier cold start).")
 
-## streamlit app
-st.title('Customer Churn Prediction')
+col1, col2 = st.columns(2)
 
-# User input
-geography = st.selectbox('Geography', Onehot_encoder_geo.categories_[0]) #[array(['France', 'Germany', 'Spain'], dtype=object)]
-gender = st.selectbox('Gender', label_encoder_gender.classes_)
-age = st.slider('Age', 18, 92)
-balance = st.number_input('Balance')
-credit_score = st.number_input('Credit Score')
-estimated_salary = st.number_input('Estimated Salary')
-tenure = st.slider('Tenure', 0, 10)
-num_of_products = st.slider('Number of Products', 1, 4)
-has_cr_card = st.selectbox('Has Credit Card', [0, 1])
-is_active_member = st.selectbox('Is Active Member', [0, 1])
+with col1:
+    geography = st.selectbox('Geography', ['France', 'Germany', 'Spain'])
+    gender = st.selectbox('Gender', ['Male', 'Female'])
+    age = st.slider('Age', 18, 92, 35)
+    tenure = st.slider('Tenure (years with bank)', 0, 10, 3)
+    num_of_products = st.slider('Number of Products', 1, 4, 1)
 
-# Prepare the input data
-input_data = pd.DataFrame({
-    'CreditScore': [credit_score],
-    'Gender': [label_encoder_gender.transform([gender])[0]],
-    'Age': [age],
-    'Tenure': [tenure],
-    'Balance': [balance],
-    'NumOfProducts': [num_of_products],
-    'HasCrCard': [has_cr_card],
-    'IsActiveMember': [is_active_member],
-    'EstimatedSalary': [estimated_salary]
-})
+with col2:
+    credit_score = st.number_input('Credit Score', min_value=350, max_value=850, value=650)
+    balance = st.number_input('Account Balance', min_value=0.0, value=50000.0, step=1000.0)
+    estimated_salary = st.number_input('Estimated Salary', min_value=0.0, value=60000.0, step=1000.0)
+    has_cr_card = st.selectbox('Has Credit Card', ['Yes', 'No'])
+    is_active_member = st.selectbox('Is Active Member', ['Yes', 'No'])
 
+st.write("")
+predict_clicked = st.button('🔮 Predict', use_container_width=True)
 
-# One-hot encode 'Geography'
-geo_encoded = Onehot_encoder_geo.transform([[geography]])
-geo_encoded_df = pd.DataFrame(geo_encoded, columns=Onehot_encoder_geo.get_feature_names_out(['Geography']))
+if predict_clicked:
+    payload = {
+        'CreditScore': credit_score,
+        'Geography': geography,
+        'Gender': gender,
+        'Age': age,
+        'Tenure': tenure,
+        'Balance': balance,
+        'NumOfProducts': num_of_products,
+        'HasCrCard': 1 if has_cr_card == 'Yes' else 0,
+        'IsActiveMember': 1 if is_active_member == 'Yes' else 0,
+        'EstimatedSalary': estimated_salary
+    }
 
-# Combine one-hot encoded columns with input data
-input_data = pd.concat([input_data.reset_index(drop=True), geo_encoded_df], axis=1)
+    with st.spinner('Talking to the model (can take a bit if it just woke up)...'):
+        try:
+            res = requests.post(f'{API_URL}/predict', json=payload, timeout=60)
+        except requests.exceptions.RequestException as e:
+            st.error(f"Could not reach the API: {e}")
+            st.stop()
 
-# Scale the input data
-input_data_scaled = scaler.transform(input_data)
+    if res.status_code != 200:
+        st.error(f"API error ({res.status_code}): {res.text}")
+        st.stop()
 
-prediction=model.predict(input_data_scaled)
-prediction_prob=prediction[0][0]
+    data = res.json()
+    prob = data['churn_probability']
+    will_churn = data['prediction'] == 1
 
-st.write(f'Churn Probability: {prediction_prob:.2f}')
+    box_class = "churn" if will_churn else "stay"
+    emoji = "⚠️" if will_churn else "✅"
 
-if prediction_prob >0.5 :
-    st.write("The customer is likely to churn")
-else:
-    st.write("The customer is not likely to churn")    
+    st.markdown(f"""
+    <div class="result-box {box_class}">
+        <h3>{emoji} {data['result']}</h3>
+        <p>Churn probability: <b>{prob*100:.1f}%</b></p>
+    </div>
+    """, unsafe_allow_html=True)
+
+    st.progress(min(max(prob, 0.0), 1.0))
